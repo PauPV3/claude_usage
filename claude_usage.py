@@ -240,8 +240,20 @@ def compute(sessions, since=None, until=None, proj_filter=None, sort_by="cost"):
 
 
 # =====================  TEXT MODE (with flags)  =====================
+def project_width(rows, term_w, fixed):
+    """Pick a PROJECT column width that fits the longest name without overflowing
+    the terminal. 'fixed' is the width taken by every other column (incl. spaces)."""
+    longest = max((len(r["project"]) for r in rows), default=0)
+    avail = max(10, term_w - 2 - fixed)   # 2 = leading indent
+    return max(len("PROJECT"), min(longest, avail))
+
+
 def render_text(rows, totals, period_label):
-    hdr = (f"{'PROJECT':<26} {'DATE':<11} {'MODEL':<7} {'COST':>9} "
+    import shutil
+    term_w = shutil.get_terminal_size((120, 24)).columns
+    # other columns: 11+7+9+8+5+8+13 widths + 7 single spaces between them
+    pw = project_width(rows, term_w, 11 + 7 + 9 + 8 + 5 + 8 + 13 + 7)
+    hdr = (f"{'PROJECT':<{pw}} {'DATE':<11} {'MODEL':<7} {'COST':>9} "
            f"{'LINES':>8} {'FILES':>5} {'PROMPTS':>8} {'TOKENS':>13}")
     print()
     print(C["b"] + "  CLAUDE CODE USAGE PER CONVERSATION" + C["x"]
@@ -252,11 +264,11 @@ def render_text(rows, totals, period_label):
     for r in rows:
         cost_s = f"${r['cost']:.2f}"
         col = C["g"] if r["cost"] < 10 else (C["y"] if r["cost"] < 50 else C["r"])
-        print(f"  {r['project'][:25]:<26} {r['date']:<11} {r['model']:<7} "
+        print(f"  {r['project'][:pw]:<{pw}} {r['date']:<11} {r['model']:<7} "
               f"{col}{cost_s:>9}{C['x']} {r['lines']:>8,} {r['files']:>5} "
               f"{r['prompts']:>8} {C['d']}{r['tokens']:>13,}{C['x']}")
     print(C["d"] + "  " + "-" * len(hdr) + C["x"])
-    print(f"  {'TOTAL (' + str(totals['n']) + ' conversations)':<26} {'':<11} {'':<7} "
+    print(f"  {'TOTAL (' + str(totals['n']) + ' conversations)':<{pw}} {'':<11} {'':<7} "
           f"{C['b']}${totals['cost']:>8.2f}{C['x']} {C['b']}{totals['lines']:>8,}{C['x']} "
           f"{totals['files']:>5} {totals['prompts']:>8} {totals['tokens']:>13,}")
     print()
@@ -309,7 +321,9 @@ def run_tui(sessions, today):
     sorts = [("cost", "cost"), ("lines", "lines"), ("date", "date"),
              ("tokens", "tokens"), ("prompts", "prompts")]
 
-    def draw(stdscr, pi, si):
+    FIRST_ROW = 6  # screen y of the first data row
+
+    def draw(stdscr, pi, si, rows, t, sel):
         stdscr.erase()
         h, w = stdscr.getmaxyx()
         A = curses.A_BOLD
@@ -324,12 +338,10 @@ def run_tui(sessions, today):
             except curses.error:
                 pass
 
-        plabel, since, until = periods[pi]
         sort_label, sort_key = sorts[si]
-        rows, t = compute(sessions, since, until, None, sort_key)
 
         put(0, 2, "CLAUDE CODE USAGE", A | CY)
-        put(0, 22, "<- ->  period   |   ^ v  sort   |   q  quit", DM)
+        put(0, 22, "<- ->  period   |   ^ v  select row   |   s  sort   |   q  quit", DM)
         # period chips
         x = 2
         for i, (name, _, _) in enumerate(periods):
@@ -340,20 +352,28 @@ def run_tui(sessions, today):
             x += len(chip) + 1
         put(2, 2, f"Sorted by: {sort_label}", YE | A)
 
-        hdr = (f"{'PROJECT':<24} {'DATE':<11} {'MODEL':<6} {'COST':>9} "
+        # dynamic PROJECT width: fit the longest name, capped by the terminal.
+        # other columns: 11+6+9+7+5+7+13 widths + 7 single spaces between them
+        pw = project_width(rows, w, 11 + 6 + 9 + 7 + 5 + 7 + 13 + 7)
+        hdr = (f"{'PROJECT':<{pw}} {'DATE':<11} {'MODEL':<6} {'COST':>9} "
                f"{'LINES':>7} {'FILES':>5} {'PROMPTS':>7} {'TOKENS':>13}")
         put(4, 2, hdr, A)
         put(5, 2, "-" * len(hdr), DM)
-        maxrows = max(1, h - 12)
-        for idx, r in enumerate(rows[:maxrows]):
+        maxrows = max(1, h - 13)
+        shown = rows[:maxrows]
+        for idx, r in enumerate(shown):
+            y = FIRST_ROW + idx
             col = GR if r["cost"] < 10 else (YE if r["cost"] < 50 else RE)
-            line = (f"{r['project'][:23]:<24} {r['date']:<11} {r['model']:<6} "
+            name = r["project"]
+            disp = name if len(name) <= pw else name[:pw - 1] + "…"
+            line = (f"{disp:<{pw}} {r['date']:<11} {r['model']:<6} "
                     f"{('$%.2f' % r['cost']):>9} {r['lines']:>7,} {r['files']:>5} "
                     f"{r['prompts']:>7} {r['tokens']:>13,}")
-            put(6 + idx, 2, line, col)
-        yb = 6 + min(len(rows), maxrows) + 1
+            attr = (curses.A_REVERSE | A) if idx == sel else col
+            put(y, 2, line, attr)
+        yb = FIRST_ROW + len(shown) + 1
         put(yb, 2, "-" * len(hdr), DM)
-        tot = (f"{'TOTAL (' + str(t['n']) + ' conversations)':<24} {'':<11} {'':<6} "
+        tot = (f"{'TOTAL (' + str(t['n']) + ' conversations)':<{pw}} {'':<11} {'':<6} "
                f"{('$%.2f' % t['cost']):>9} {t['lines']:>7,} {t['files']:>5} "
                f"{t['prompts']:>7} {t['tokens']:>13,}")
         put(yb + 1, 2, tot, A)
@@ -361,6 +381,11 @@ def run_tui(sessions, today):
         put(yb + 3, 2,
             f"Total cost ${t['cost']:,.2f}    |    {t['lines']:,} lines written"
             f"    |    ${cpl:,.2f} per 1,000 lines", CY | A)
+        # full name of the currently selected row (always readable, even if the
+        # column above had to truncate it)
+        if shown:
+            full = shown[sel]["project"]
+            put(h - 1, 2, ("Selected:  " + full)[:max(0, w - 3)], YE | A)
         stdscr.refresh()
 
     def loop(stdscr):
@@ -372,18 +397,46 @@ def run_tui(sessions, today):
             curses.init_pair(3, curses.COLOR_YELLOW, -1)
             curses.init_pair(4, curses.COLOR_RED, -1)
             curses.init_pair(5, curses.COLOR_WHITE, -1)
-        pi = 0; si = 0
+        # mouse click also selects a row (works even where hover doesn't)
+        mouse_ok = False
+        try:
+            curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED)
+            mouse_ok = True
+        except curses.error:
+            pass
+        pi = 0; si = 0; sel = 0
         while True:
-            draw(stdscr, pi, si)
+            h, _w = stdscr.getmaxyx()
+            since, until = periods[pi][1], periods[pi][2]
+            rows, t = compute(sessions, since, until, None, sorts[si][1])
+            nshown = min(len(rows), max(1, h - 13))
+            sel = 0 if nshown == 0 else max(0, min(sel, nshown - 1))
+
+            draw(stdscr, pi, si, rows, t, sel)
             k = stdscr.getch()
+
             if k in (ord("q"), ord("Q"), 27):
                 break
+            elif k in (curses.KEY_DOWN, ord("j")):
+                if nshown:
+                    sel = (sel + 1) % nshown
+            elif k in (curses.KEY_UP, ord("k")):
+                if nshown:
+                    sel = (sel - 1) % nshown
             elif k in (curses.KEY_RIGHT, ord("l")):
-                pi = (pi + 1) % len(periods)
+                pi = (pi + 1) % len(periods); sel = 0
             elif k in (curses.KEY_LEFT, ord("h")):
-                pi = (pi - 1) % len(periods)
-            elif k in (curses.KEY_DOWN, curses.KEY_UP, ord("s")):
-                si = (si + 1) % len(sorts)
+                pi = (pi - 1) % len(periods); sel = 0
+            elif k in (ord("s"), ord("S")):
+                si = (si + 1) % len(sorts); sel = 0
+            elif k == curses.KEY_MOUSE and mouse_ok:
+                try:
+                    _, _mx, my, _, _ = curses.getmouse()
+                except Exception:
+                    continue
+                idx = my - FIRST_ROW
+                if 0 <= idx < nshown:
+                    sel = idx
 
     curses.wrapper(loop)
 

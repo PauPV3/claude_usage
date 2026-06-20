@@ -17,7 +17,15 @@ The cost calculation mirrors the prices Anthropic applies (input, output and the
 python3 claude_usage.py
 ```
 
-With no flags, in a real terminal, it opens an **interactive menu** (arrow keys to change the period and the sort order, `q` to quit).
+With no flags, in a real terminal, it opens an **interactive menu**:
+
+- `←` / `→` — change the time period
+- `↑` / `↓` — select a row; the full project name of the selected row is shown at the bottom (handy when a long name is truncated to `…` in the table)
+- `s` — cycle the sort order
+- mouse click — select a row
+- `q` (or `Esc`) — quit
+
+The `PROJECT` column width adapts to the longest name and the terminal width, so names are shown in full whenever they fit.
 
 ### Text mode (with flags)
 
