@@ -202,28 +202,34 @@ def compute(sessions, since=None, until=None, proj_filter=None, sort_by="cost"):
             return False
         return True
 
-    rows = []
+    # Aggregate by PROJECT: every session of the same project is summed into a
+    # single row (instead of one row per conversation).
+    agg = {}
     for s in sessions:
         if proj_filter and proj_filter not in s["project"].lower():
             continue
-        cost = tokens = lines = prompts = 0
-        files = set()
-        models = set()
-        last = ""
+        a = agg.get(s["project"])
+        if a is None:
+            a = agg[s["project"]] = {"cost": 0.0, "tokens": 0, "lines": 0,
+                                     "prompts": 0, "files": set(), "models": set(),
+                                     "last": ""}
         for d, v in s["days"].items():
             if not in_range(d):
                 continue
-            cost += v["cost"]; tokens += v["tokens"]; lines += v["lines"]
-            prompts += v["prompts"]; files |= v["files"]; models |= v["models"]
-            if d > last:
-                last = d
-        if not last:  # no activity within the range
+            a["cost"] += v["cost"]; a["tokens"] += v["tokens"]; a["lines"] += v["lines"]
+            a["prompts"] += v["prompts"]; a["files"] |= v["files"]; a["models"] |= v["models"]
+            if d > a["last"]:
+                a["last"] = d
+
+    rows = []
+    for project, a in agg.items():
+        if not a["last"]:  # no activity within the range
             continue
-        model = "opus" if any("opus" in m for m in models) else (
-                "sonnet" if any("sonnet" in m for m in models) else "?")
-        rows.append({"project": s["project"], "cost": cost, "tokens": tokens,
-                     "lines": lines, "files": len(files), "prompts": prompts,
-                     "date": last, "model": model})
+        model = "opus" if any("opus" in m for m in a["models"]) else (
+                "sonnet" if any("sonnet" in m for m in a["models"]) else "?")
+        rows.append({"project": project, "cost": a["cost"], "tokens": a["tokens"],
+                     "lines": a["lines"], "files": len(a["files"]), "prompts": a["prompts"],
+                     "date": a["last"], "model": model})
 
     keymap = {"cost": "cost", "lines": "lines", "date": "date",
               "tokens": "tokens", "files": "files", "prompts": "prompts"}
@@ -256,7 +262,7 @@ def render_text(rows, totals, period_label):
     hdr = (f"{'PROJECT':<{pw}} {'DATE':<11} {'MODEL':<7} {'COST':>9} "
            f"{'LINES':>8} {'FILES':>5} {'PROMPTS':>8} {'TOKENS':>13}")
     print()
-    print(C["b"] + "  CLAUDE CODE USAGE PER CONVERSATION" + C["x"]
+    print(C["b"] + "  CLAUDE CODE USAGE PER PROJECT" + C["x"]
           + C["d"] + f"   ({period_label})" + C["x"])
     print(C["d"] + "  " + "-" * len(hdr) + C["x"])
     print("  " + C["b"] + hdr + C["x"])
@@ -268,7 +274,7 @@ def render_text(rows, totals, period_label):
               f"{col}{cost_s:>9}{C['x']} {r['lines']:>8,} {r['files']:>5} "
               f"{r['prompts']:>8} {C['d']}{r['tokens']:>13,}{C['x']}")
     print(C["d"] + "  " + "-" * len(hdr) + C["x"])
-    print(f"  {'TOTAL (' + str(totals['n']) + ' conversations)':<{pw}} {'':<11} {'':<7} "
+    print(f"  {'TOTAL (' + str(totals['n']) + ' projects)':<{pw}} {'':<11} {'':<7} "
           f"{C['b']}${totals['cost']:>8.2f}{C['x']} {C['b']}{totals['lines']:>8,}{C['x']} "
           f"{totals['files']:>5} {totals['prompts']:>8} {totals['tokens']:>13,}")
     print()
@@ -373,7 +379,7 @@ def run_tui(sessions, today):
             put(y, 2, line, attr)
         yb = FIRST_ROW + len(shown) + 1
         put(yb, 2, "-" * len(hdr), DM)
-        tot = (f"{'TOTAL (' + str(t['n']) + ' conversations)':<{pw}} {'':<11} {'':<6} "
+        tot = (f"{'TOTAL (' + str(t['n']) + ' projects)':<{pw}} {'':<11} {'':<6} "
                f"{('$%.2f' % t['cost']):>9} {t['lines']:>7,} {t['files']:>5} "
                f"{t['prompts']:>7} {t['tokens']:>13,}")
         put(yb + 1, 2, tot, A)
