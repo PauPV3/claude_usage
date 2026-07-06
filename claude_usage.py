@@ -5,6 +5,7 @@ claude_usage.py — Claude Code usage summary
 For each conversation (session) it shows:
   - Project
   - Cost in dollars (computed like ccusage, with correct cache prices)
+  - Active model usage time
   - Lines of code written/edited (Write + Edit + MultiEdit + NotebookEdit)
   - Files touched
   - Number of prompts (your messages)
@@ -15,6 +16,7 @@ And a grand TOTAL at the end.
 
 Usage:
   python3 claude_usage.py              # sorted by cost (descending)
+  python3 claude_usage.py --by time    # sorted by active usage time
   python3 claude_usage.py --by lines   # sorted by lines written
   python3 claude_usage.py --by date    # sorted by date
   python3 claude_usage.py --top 10     # only the first 10
@@ -53,30 +55,67 @@ def count_lines(text):
     return text.count("\n") + 1
 
 
+def parse_ts(ts_str):
+    if not ts_str:
+        return None
+    ts_str = ts_str.replace("Z", "")
+    if "." in ts_str:
+        fmt = "%Y-%m-%dT%H:%M:%S.%f"
+    else:
+        fmt = "%Y-%m-%dT%H:%M:%S"
+    try:
+        return datetime.datetime.strptime(ts_str[:26], fmt)
+    except:
+        return None
+
+
+def format_time(seconds):
+    s = int(seconds)
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    if h > 0:
+        return f"{h}h {m}m"
+    elif m > 0:
+        return f"{m}m {sec}s"
+    else:
+        return f"{sec}s"
+
+
 # ---- prices per MILLION tokens (USD), as applied by Anthropic ----
 #  in = input | out = output | cw5 = cache write 5min | cw1h = cache write 1h | cr = cache read
-#  (Opus 4.8 is ~3x cheaper than classic Opus; validated against ccusage)
+#  Sonnet 5 introductory pricing through August 31, 2026.
+#  Validated against official Anthropic pricing.
 PRICES = {
-    "opus":   {"in": 5.0,  "out": 25.0, "cw5": 6.25,  "cw1h": 10.0, "cr": 0.50},
-    "sonnet": {"in": 3.0,  "out": 15.0, "cw5": 3.75,  "cw1h": 6.0,  "cr": 0.30},
-    "haiku":  {"in": 1.0,  "out": 5.0,  "cw5": 1.25,  "cw1h": 2.0,  "cr": 0.10},
+    "opus":          {"in": 5.0,  "out": 25.0, "cw5": 6.25,  "cw1h": 10.0, "cr": 0.50},
+    "sonnet":        {"in": 3.0,  "out": 15.0, "cw5": 3.75,  "cw1h": 6.0,  "cr": 0.30},
+    "haiku":         {"in": 1.0,  "out": 5.0,  "cw5": 1.25,  "cw1h": 2.0,  "cr": 0.10},
+    "fable5":        {"in": 10.0, "out": 50.0, "cw5": 12.50, "cw1h": 20.0, "cr": 1.00},
+    "sonnet5_intro": {"in": 2.0,  "out": 10.0, "cw5": 2.50,  "cw1h": 4.0,  "cr": 0.20},
+    "sonnet5_std":   {"in": 3.0,  "out": 15.0, "cw5": 3.75,  "cw1h": 6.0,  "cr": 0.30},
 }
 
 
-def price_for(model):
+def price_for(model, date_str=None):
     if not model:
         return PRICES["opus"]
     m = model.lower()
-    if "opus" in m:
-        return PRICES["opus"]
+    if "fable" in m:
+        return PRICES["fable5"]
+    if "sonnet" in m and "5" in m:
+        if date_str and date_str <= "2026-08-31":
+            return PRICES["sonnet5_intro"]
+        return PRICES["sonnet5_std"]
     if "haiku" in m:
         return PRICES["haiku"]
+    if "opus" in m:
+        return PRICES["opus"]
     return PRICES["sonnet"]
 
 
-def msg_cost(model, u):
+def msg_cost(model, u, date_str=None):
     """Cost in USD of a single message, from its 'usage' block."""
-    p = price_for(model)
+    p = price_for(model, date_str)
     cc = u.get("cache_creation") or {}
     cw1h = cc.get("ephemeral_1h_input_tokens", 0)
     cw5 = cc.get("ephemeral_5m_input_tokens", 0)
@@ -110,10 +149,15 @@ def demangle(dirname):
 
 def parse_days(path, seen):
     """Read a .jsonl file and return data GROUPED BY DAY:
-       { 'YYYY-MM-DD': {cost,tokens,lines,prompts, files:set, models:set} }
+       { 'YYYY-MM-DD': {cost,tokens,lines,prompts, files:set, models:set, time} }
     'seen' is a shared set of (message.id, requestId) used for deduplication."""
     days = defaultdict(lambda: {"cost": 0.0, "tokens": 0, "lines": 0,
-                                "prompts": 0, "files": set(), "models": set()})
+                                "prompts": 0, "files": set(), "models": set(), "time": 0.0})
+    
+    current_user_ts = None
+    current_turn_duration = 0.0
+    current_turn_day = None
+
     with open(path, "r", errors="ignore") as f:
         for line in f:
             line = line.strip()
@@ -123,10 +167,31 @@ def parse_days(path, seen):
                 o = json.loads(line)
             except Exception:
                 continue
+            
+            mtype = o.get("type")
             msg = o.get("message") or {}
             if not isinstance(msg, dict):
-                continue
-            # dedup by billing key (message.id, requestId); fall back to uuid
+                msg = {}
+            role = msg.get("role")
+            timestamp = o.get("timestamp")
+            
+            # Update active usage time tracking
+            if timestamp:
+                ts = parse_ts(timestamp)
+                if ts:
+                    d_ts = timestamp[:10]
+                    if mtype == "user" or role == "user":
+                        if current_user_ts is not None and current_turn_day is not None:
+                            days[current_turn_day]["time"] += current_turn_duration
+                        current_user_ts = ts
+                        current_turn_day = d_ts
+                        current_turn_duration = 0.0
+                    elif (mtype == "assistant" or role == "assistant") and current_user_ts is not None:
+                        diff = (ts - current_user_ts).total_seconds()
+                        if diff > 0:
+                            current_turn_duration = max(current_turn_duration, diff)
+
+            # Process rest of metrics (with deduplication)
             mid = msg.get("id")
             rid = o.get("requestId")
             dkey = (mid, rid) if mid and rid else o.get("uuid")
@@ -138,13 +203,12 @@ def parse_days(path, seen):
             if not d:
                 continue
             day = days[d]
-            role = msg.get("role")
             model = msg.get("model")
             if model:
                 day["models"].add(model)
             u = msg.get("usage")
             if isinstance(u, dict):
-                day["cost"] += msg_cost(model, u)
+                day["cost"] += msg_cost(model, u, date_str=d)
                 day["tokens"] += (u.get("input_tokens", 0) + u.get("output_tokens", 0)
                                   + u.get("cache_read_input_tokens", 0)
                                   + u.get("cache_creation_input_tokens", 0))
@@ -173,6 +237,11 @@ def parse_days(path, seen):
                         day["lines"] += count_lines(inp.get("new_source", ""))
                     if name in ("Write", "Edit", "MultiEdit", "NotebookEdit") and fp:
                         day["files"].add(fp)
+                        
+    # Add final turn
+    if current_user_ts is not None and current_turn_day is not None:
+        days[current_turn_day]["time"] += current_turn_duration
+        
     return days
 
 
@@ -212,12 +281,13 @@ def compute(sessions, since=None, until=None, proj_filter=None, sort_by="cost"):
         if a is None:
             a = agg[s["project"]] = {"cost": 0.0, "tokens": 0, "lines": 0,
                                      "prompts": 0, "files": set(), "models": set(),
-                                     "last": ""}
+                                     "last": "", "time": 0.0}
         for d, v in s["days"].items():
             if not in_range(d):
                 continue
             a["cost"] += v["cost"]; a["tokens"] += v["tokens"]; a["lines"] += v["lines"]
             a["prompts"] += v["prompts"]; a["files"] |= v["files"]; a["models"] |= v["models"]
+            a["time"] += v.get("time", 0.0)
             if d > a["last"]:
                 a["last"] = d
 
@@ -225,13 +295,20 @@ def compute(sessions, since=None, until=None, proj_filter=None, sort_by="cost"):
     for project, a in agg.items():
         if not a["last"]:  # no activity within the range
             continue
-        model = "opus" if any("opus" in m for m in a["models"]) else (
-                "sonnet" if any("sonnet" in m for m in a["models"]) else "?")
+        model = "?"
+        if any("fable" in m for m in a["models"]):
+            model = "fable"
+        elif any("opus" in m for m in a["models"]):
+            model = "opus"
+        elif any("haiku" in m for m in a["models"]):
+            model = "haiku"
+        elif any("sonnet" in m for m in a["models"]):
+            model = "sonnet"
         rows.append({"project": project, "cost": a["cost"], "tokens": a["tokens"],
                      "lines": a["lines"], "files": len(a["files"]), "prompts": a["prompts"],
-                     "date": a["last"], "model": model})
+                     "date": a["last"], "model": model, "time": a["time"]})
 
-    keymap = {"cost": "cost", "lines": "lines", "date": "date",
+    keymap = {"cost": "cost", "time": "time", "lines": "lines", "date": "date",
               "tokens": "tokens", "files": "files", "prompts": "prompts"}
     rows.sort(key=lambda r: r[keymap.get(sort_by, "cost")], reverse=(sort_by != "date"))
     totals = {
@@ -240,6 +317,7 @@ def compute(sessions, since=None, until=None, proj_filter=None, sort_by="cost"):
         "files": sum(r["files"] for r in rows),
         "prompts": sum(r["prompts"] for r in rows),
         "tokens": sum(r["tokens"] for r in rows),
+        "time": sum(r["time"] for r in rows),
         "n": len(rows),
     }
     return rows, totals
@@ -257,10 +335,10 @@ def project_width(rows, term_w, fixed):
 def render_text(rows, totals, period_label):
     import shutil
     term_w = shutil.get_terminal_size((120, 24)).columns
-    # other columns: 11+7+9+8+5+8+13 widths + 7 single spaces between them
-    pw = project_width(rows, term_w, 11 + 7 + 9 + 8 + 5 + 8 + 13 + 7)
+    # other columns: 11+7+9+8+8+5+8+13 widths + 8 single spaces between them = 77 widths
+    pw = project_width(rows, term_w, 77)
     hdr = (f"{'PROJECT':<{pw}} {'DATE':<11} {'MODEL':<7} {'COST':>9} "
-           f"{'LINES':>8} {'FILES':>5} {'PROMPTS':>8} {'TOKENS':>13}")
+           f"{'TIME':>8} {'LINES':>8} {'FILES':>5} {'PROMPTS':>8} {'TOKENS':>13}")
     print()
     print(C["b"] + "  CLAUDE CODE USAGE PER PROJECT" + C["x"]
           + C["d"] + f"   ({period_label})" + C["x"])
@@ -270,16 +348,19 @@ def render_text(rows, totals, period_label):
     for r in rows:
         cost_s = f"${r['cost']:.2f}"
         col = C["g"] if r["cost"] < 10 else (C["y"] if r["cost"] < 50 else C["r"])
+        time_s = format_time(r["time"])
         print(f"  {r['project'][:pw]:<{pw}} {r['date']:<11} {r['model']:<7} "
-              f"{col}{cost_s:>9}{C['x']} {r['lines']:>8,} {r['files']:>5} "
+              f"{col}{cost_s:>9}{C['x']} {time_s:>8} {r['lines']:>8,} {r['files']:>5} "
               f"{r['prompts']:>8} {C['d']}{r['tokens']:>13,}{C['x']}")
     print(C["d"] + "  " + "-" * len(hdr) + C["x"])
+    tot_time = format_time(totals["time"])
     print(f"  {'TOTAL (' + str(totals['n']) + ' projects)':<{pw}} {'':<11} {'':<7} "
-          f"{C['b']}${totals['cost']:>8.2f}{C['x']} {C['b']}{totals['lines']:>8,}{C['x']} "
+          f"{C['b']}${totals['cost']:>8.2f}{C['x']} {C['b']}{tot_time:>8}{C['x']} {C['b']}{totals['lines']:>8,}{C['x']} "
           f"{totals['files']:>5} {totals['prompts']:>8} {totals['tokens']:>13,}")
     print()
     print(C["b"] + "  OVERALL SUMMARY" + C["x"])
     print(f"    Total cost ........... {C['r']}${totals['cost']:,.2f}{C['x']}")
+    print(f"    Total time active .... {C['g']}{tot_time}{C['x']}")
     print(f"    Lines of code written  {C['c']}{totals['lines']:,}{C['x']}")
     print(f"    Files touched ........ {totals['files']:,}")
     print(f"    Prompts (yours) ...... {totals['prompts']:,}")
@@ -324,7 +405,7 @@ def run_tui(sessions, today):
         ("This month",   today.replace(day=1).isoformat(), None),
         ("This year",    today.replace(month=1, day=1).isoformat(), None),
     ]
-    sorts = [("cost", "cost"), ("lines", "lines"), ("date", "date"),
+    sorts = [("cost", "cost"), ("time", "time"), ("lines", "lines"), ("date", "date"),
              ("tokens", "tokens"), ("prompts", "prompts")]
 
     FIRST_ROW = 6  # screen y of the first data row
@@ -359,10 +440,10 @@ def run_tui(sessions, today):
         put(2, 2, f"Sorted by: {sort_label}", YE | A)
 
         # dynamic PROJECT width: fit the longest name, capped by the terminal.
-        # other columns: 11+6+9+7+5+7+13 widths + 7 single spaces between them
-        pw = project_width(rows, w, 11 + 6 + 9 + 7 + 5 + 7 + 13 + 7)
+        # other columns: 11+6+9+7+7+5+7+13 widths + 8 spaces
+        pw = project_width(rows, w, 11 + 6 + 9 + 7 + 7 + 5 + 7 + 13 + 8)
         hdr = (f"{'PROJECT':<{pw}} {'DATE':<11} {'MODEL':<6} {'COST':>9} "
-               f"{'LINES':>7} {'FILES':>5} {'PROMPTS':>7} {'TOKENS':>13}")
+               f"{'TIME':>7} {'LINES':>7} {'FILES':>5} {'PROMPTS':>7} {'TOKENS':>13}")
         put(4, 2, hdr, A)
         put(5, 2, "-" * len(hdr), DM)
         maxrows = max(1, h - 13)
@@ -372,20 +453,23 @@ def run_tui(sessions, today):
             col = GR if r["cost"] < 10 else (YE if r["cost"] < 50 else RE)
             name = r["project"]
             disp = name if len(name) <= pw else name[:pw - 1] + "…"
+            time_s = format_time(r["time"])
             line = (f"{disp:<{pw}} {r['date']:<11} {r['model']:<6} "
-                    f"{('$%.2f' % r['cost']):>9} {r['lines']:>7,} {r['files']:>5} "
+                    f"{('$%.2f' % r['cost']):>9} {time_s:>7} {r['lines']:>7,} {r['files']:>5} "
                     f"{r['prompts']:>7} {r['tokens']:>13,}")
             attr = (curses.A_REVERSE | A) if idx == sel else col
             put(y, 2, line, attr)
         yb = FIRST_ROW + len(shown) + 1
         put(yb, 2, "-" * len(hdr), DM)
+        tot_time = format_time(t["time"])
         tot = (f"{'TOTAL (' + str(t['n']) + ' projects)':<{pw}} {'':<11} {'':<6} "
-               f"{('$%.2f' % t['cost']):>9} {t['lines']:>7,} {t['files']:>5} "
+               f"{('$%.2f' % t['cost']):>9} {tot_time:>7} {t['lines']:>7,} {t['files']:>5} "
                f"{t['prompts']:>7} {t['tokens']:>13,}")
         put(yb + 1, 2, tot, A)
         cpl = (t["cost"] / t["lines"] * 1000) if t["lines"] else 0
         put(yb + 3, 2,
-            f"Total cost ${t['cost']:,.2f}    |    {t['lines']:,} lines written"
+            f"Total cost ${t['cost']:,.2f}    |    {tot_time} active"
+            f"    |    {t['lines']:,} lines written"
             f"    |    ${cpl:,.2f} per 1,000 lines", CY | A)
         # full name of the currently selected row (always readable, even if the
         # column above had to truncate it)
@@ -483,9 +567,14 @@ def main():
                   "lines": sum(r["lines"] for r in rows),
                   "files": sum(r["files"] for r in rows),
                   "prompts": sum(r["prompts"] for r in rows),
-                  "tokens": sum(r["tokens"] for r in rows), "n": len(rows)}
+                  "tokens": sum(r["tokens"] for r in rows),
+                  "time": sum(r["time"] for r in rows),
+                  "n": len(rows)}
     render_text(rows, totals, label)
 
 
 if __name__ == "__main__":
     main()
+
+
+

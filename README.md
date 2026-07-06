@@ -1,6 +1,6 @@
 # claude_usage
 
-A **Claude Code** usage summary: for each conversation (session) it computes the cost in dollars, lines of code written, files touched, prompts and tokens, by reading your local history (`~/.claude/projects/*.jsonl`).
+A **Claude Code** usage summary: for each conversation (session) it computes the cost in dollars, active model usage time, lines of code written, files touched, prompts and tokens, by reading your local history (`~/.claude/projects/*.jsonl`).
 
 The cost calculation mirrors the prices Anthropic applies (input, output and the three cache modes), so the totals match [`ccusage`](https://github.com/ryoppippi/ccusage).
 
@@ -21,7 +21,7 @@ With no flags, in a real terminal, it opens an **interactive menu**:
 
 - `←` / `→` — change the time period
 - `↑` / `↓` — select a row; the full project name of the selected row is shown at the bottom (handy when a long name is truncated to `…` in the table)
-- `s` — cycle the sort order
+- `s` — cycle the sort order (including cost, time, lines, date, prompts, tokens)
 - mouse click — select a row
 - `q` (or `Esc`) — quit
 
@@ -31,6 +31,7 @@ The `PROJECT` column width adapts to the longest name and the terminal width, so
 
 ```bash
 python3 claude_usage.py              # sorted by cost (descending)
+python3 claude_usage.py --by time    # sorted by active usage time
 python3 claude_usage.py --by lines   # sorted by lines written
 python3 claude_usage.py --by date    # sorted by date
 python3 claude_usage.py --top 10     # only the first 10
@@ -63,10 +64,12 @@ source ~/.zshrc
 - Reads every `.jsonl` under `~/.claude/projects` once.
 - Deduplicates by billing key (`message.id`, `requestId`) so the same message is never counted twice.
 - Derives the project name from the Claude Code folder name, computing the current user's home — so it's **portable** across machines.
+- **Active Model Usage Time**: Computed by measuring the timestamps difference between the user prompt and the final assistant response in each conversation turn (excluding user typing or idle times).
 - Lines counted come from the `Write`, `Edit`, `MultiEdit` and `NotebookEdit` tools.
 
 ## Notes
 
+- **Supported Models**: Supports all Anthropic Claude models including Opus, Sonnet, Haiku, **Claude Fable 5** and **Claude Sonnet 5** (handling introductory pricing transition).
 - Prices live in the `PRICES` dict inside the script; update them if Anthropic changes them.
 - Costs are an estimate based on the locally recorded token usage and may differ slightly from your official billing.
 
